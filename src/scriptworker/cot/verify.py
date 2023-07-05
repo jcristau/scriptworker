@@ -807,12 +807,12 @@ def get_all_artifacts_per_task_id(chain, upstream_artifacts):
     """
     all_artifacts_per_task_id = {}
     for link in chain.links:
-        # Download task-graph.json for decision+action task cot verification
+        # Download task-graph.json and actions.json for decision+action task cot verification
         if link.task_type in PARENT_TASK_TYPES:
             add_enumerable_item_to_dict(dict_=all_artifacts_per_task_id, key=link.task_id, item="public/task-graph.json")
-        # Download actions.json for decision+action task cot verification
-        if link.task_type in DECISION_TASK_TYPES:
             add_enumerable_item_to_dict(dict_=all_artifacts_per_task_id, key=link.task_id, item="public/actions.json")
+        # Download parameters.yml for decision task cot verification
+        if link.task_type in DECISION_TASK_TYPES:
             add_enumerable_item_to_dict(dict_=all_artifacts_per_task_id, key=link.task_id, item="public/parameters.yml")
 
     if upstream_artifacts:
