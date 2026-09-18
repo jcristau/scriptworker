@@ -110,6 +110,12 @@ DEFAULT_CONFIG: immutabledict[str, Any] = immutabledict(
         ),
         "project_configuration_url": "https://raw.githubusercontent.com/mozilla-releng/fxci-config/main/projects.yml",
         "pushlog_url": "{repo}/json-pushes?changeset={revision}&version=2&full=1",
+        # Base url of the git<->hg revision mapping service (lando). Used during
+        # the firefox hg->git migration to accept tasks whose metadata.source is
+        # still on mercurial while they build from the github monorepo, by
+        # confirming the git head revision maps to the hg source revision. Set to
+        # an empty string to disable (and keep the strict source/repo check).
+        "git_hg_revision_mapper_url": "https://lando.moz.tools/api",
         "chain_of_trust_hash_algorithm": "sha256",
         "cot_schema_path": os.path.join(os.path.dirname(__file__), "data", "cot_v1_schema.json"),
         # for download url validation.  The regexes need to define a 'filepath'.

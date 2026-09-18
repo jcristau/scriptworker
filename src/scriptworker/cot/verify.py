@@ -39,8 +39,8 @@ from scriptworker.config import apply_product_config, read_worker_creds
 from scriptworker.constants import DEFAULT_CONFIG
 from scriptworker.context import Context
 from scriptworker.ed25519 import ed25519_public_key_from_string, verify_ed25519_signature
-from scriptworker.exceptions import BaseDownloadError, CoTError, ScriptWorkerEd25519Error
-from scriptworker.github import GitHubRepository, extract_github_repo_full_name, extract_github_repo_owner_and_name, extract_github_repo_ssh_url
+from scriptworker.exceptions import BaseDownloadError, CoTError, ScriptWorkerEd25519Error, ScriptWorkerException
+from scriptworker.github import GitHubRepository, extract_github_repo_full_name, extract_github_repo_owner_and_name, extract_github_repo_ssh_url, is_github_url
 from scriptworker.log import contextual_log_handler, get_chain_of_trust_log_filename
 from scriptworker.task import (
     get_action_callback_name,
@@ -72,6 +72,7 @@ from scriptworker.utils import (
     format_json,
     get_hash,
     get_loggable_url,
+    get_parts_of_url_path,
     get_results_and_future_exceptions,
     load_json_or_yaml,
     load_json_or_yaml_from_url,
@@ -79,6 +80,7 @@ from scriptworker.utils import (
     match_url_path_callback,
     match_url_regex,
     raise_future_exceptions,
+    retry_request,
     read_from_file,
     remove_empty_keys,
     rm,
@@ -1360,7 +1362,7 @@ async def populate_jsone_context(chain, parent_link, decision_link, tasks_for):
         else:
             raise CoTError('Unknown tasks_for "{}" for github cot_product "{}"!'.format(tasks_for, chain.context.config["cot_product"]))
     elif chain.context.config["cot_product_type"] == "hg":
-        source_url = get_source_url(decision_link)
+        source_url = await get_source_url(decision_link, chain.has_restricted_scopes())
         project = await get_project(chain.context, source_url)
         jsone_context["repository"] = {
             "url": get_repo(decision_link.task, decision_link.context.config["source_env_prefix"]),
@@ -1937,11 +1939,94 @@ def verify_repo_matches_url(repo, url):
     return True
 
 
-def get_source_url(obj):
+def _extract_hg_revision_from_source_url(url):
+    """Pull the mercurial revision out of an hg.mozilla.org source url.
+
+    hg source urls look like ``.../<repo>/file/<rev>/<path>`` or
+    ``.../<repo>/raw-file/<rev>/<path>``; the revision is the path segment
+    right after the ``file``/``raw-file``/``rev`` marker.
+
+    Args:
+        url (str): the hg source url
+
+    Returns:
+        str: the revision, or ``None`` if it can't be found.
+
+    """
+    parts = get_parts_of_url_path(url)
+    for marker in ("raw-file", "file", "rev"):
+        if marker in parts:
+            index = parts.index(marker)
+            if index + 1 < len(parts):
+                return parts[index + 1]
+    return None
+
+
+async def _github_head_matches_hg_source(obj, repo, source, restricted_privs):
+    """Tell whether a github head repo may stand in for an hg ``metadata.source``.
+
+    During the firefox hg->git migration a task may build from the github
+    monorepo (its ``*_HEAD_REPOSITORY`` env var) while its taskgraph
+    ``metadata.source`` still points at mercurial. We accept that specific
+    mismatch when the git head revision maps back to the mercurial source
+    revision, as confirmed by the configured git<->hg revision mapping service.
+
+    We fail closed: if the mapping can't be confirmed (e.g. the service has no
+    entry, as is fundamentally the case on try) we only accept the task when it
+    carries no restricted privileges -- there is then nothing to protect.
+
+    Args:
+        obj (ChainOfTrust or LinkOfTrust): the trust object being inspected
+        repo (str): the ``*_HEAD_REPOSITORY`` env value (expected to be github)
+        source (str): the hg ``metadata.source`` url
+        restricted_privs (bool): whether the chain holds restricted scopes
+
+    Returns:
+        bool: ``True`` if the mismatch is an acceptable migration source.
+
+    """
+    mapper_url = obj.context.config.get("git_hg_revision_mapper_url")
+    if not mapper_url or not is_github_url(repo):
+        return False
+    hg_revision = _extract_hg_revision_from_source_url(source)
+    git_revision = get_revision(obj.task, obj.context.config["source_env_prefix"])
+    if not hg_revision or not git_revision:
+        return False
+    try:
+        _, project = extract_github_repo_owner_and_name(repo)
+    except ValueError:
+        return False
+
+    url = "{}/git2hg/{}/{}".format(mapper_url.rstrip("/"), project, git_revision)
+    try:
+        mapping = await retry_request(obj.context, url, return_type="json")
+    except ScriptWorkerException:
+        # 404 (no mapping) or a persistent error; treated the same below.
+        mapping = None
+
+    mapped_hg_revision = mapping.get("hg_hash") if mapping else None
+    if mapped_hg_revision:
+        # A mapping exists; it must agree with the mercurial source revision.
+        if mapped_hg_revision != hg_revision:
+            log.warning(
+                "git revision %s in %s maps to hg %s, which doesn't match source revision %s!", git_revision, repo, mapped_hg_revision, hg_revision
+            )
+            return False
+        return True
+    # No trusted mapping (e.g. try). Only acceptable when nothing is at stake.
+    if restricted_privs:
+        log.warning("No git<->hg mapping for %s in %s, and the chain has restricted scopes; refusing the source.", git_revision, repo)
+    return not restricted_privs
+
+
+async def get_source_url(obj, restricted_privs=False):
     """Get the source url for a Trust object.
 
     Args:
         obj (ChainOfTrust or LinkOfTrust): the trust object to inspect
+        restricted_privs (bool): whether the chain holds restricted scopes.
+            Used to decide whether an hg source with a github head repo is
+            acceptable when the git<->hg mapping can't be confirmed.
 
     Raises:
         CoTError: if repo and source are defined and don't match
@@ -1958,7 +2043,7 @@ def get_source_url(obj):
     cot_product = obj.context.config["cot_product"]
     match_repo = repo and verify_repo_matches_url(repo, source)
     if cot_product != "enterprise":
-        if repo and not match_repo:
+        if repo and not match_repo and not await _github_head_matches_hg_source(obj, repo, source, restricted_privs):
             raise CoTError(
                 "{name} {task_id}: {source_env_prefix} {repo} doesn't match source {source}!".format(
                     name=obj.name, task_id=obj.task_id, source_env_prefix=source_env_prefix, repo=repo, source=source
@@ -2008,7 +2093,7 @@ async def trace_back_to_tree(chain):
     # a repo_path of None means we have no restricted privs.
     # a string repo_path may mean we have higher privs
     for obj in [chain] + chain.links:
-        source_url = get_source_url(obj)
+        source_url = await get_source_url(obj, restricted_privs)
         repo_path = match_url_regex(chain.context.config["trusted_vcs_rules"], source_url, match_url_path_callback)
         repos[obj] = repo_path
     # check for restricted scopes.

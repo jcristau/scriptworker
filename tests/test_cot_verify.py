@@ -19,7 +19,7 @@ from immutabledict import immutabledict
 import scriptworker.context as swcontext
 import scriptworker.cot.verify as cotverify
 from scriptworker.artifacts import get_single_upstream_artifact_full_path
-from scriptworker.exceptions import CoTError, DownloadError
+from scriptworker.exceptions import CoTError, DownloadError, ScriptWorkerException
 from scriptworker.utils import load_json_or_yaml, makedirs, read_from_file
 
 from . import create_async, noop_async, noop_sync, touch
@@ -1769,7 +1769,7 @@ async def test_verify_parent_task_definition_bad_project(chain, mocker):
     link = cotverify.LinkOfTrust(chain.context, "decision", "VQU9QMO4Teq7zr91FhBusg")
     link.task = load_json_or_yaml(os.path.join(COTV2_DIR, "decision_hg-push.json"), is_path=True)
 
-    def fake_url(*args):
+    async def fake_url(*args):
         return "https://fake_server"
 
     mocker.patch.object(cotverify, "load_json_or_yaml_from_url", new=cotv2_load_url)
@@ -2170,15 +2170,121 @@ async def test_verify_worker_impls(chain, decision_link, build_link, docker_imag
         ),
     ),
 )
-def test_get_source_url(task, expected, source_env_prefix, cot_product, raises):
+@pytest.mark.asyncio
+async def test_get_source_url(task, expected, source_env_prefix, cot_product, raises):
     obj = MagicMock()
     obj.task = task
-    obj.context.config = {"source_env_prefix": source_env_prefix, "cot_product": cot_product}
+    obj.context.config = {"source_env_prefix": source_env_prefix, "cot_product": cot_product, "git_hg_revision_mapper_url": ""}
     if raises:
         with pytest.raises(CoTError):
-            cotverify.get_source_url(obj)
+            await cotverify.get_source_url(obj)
     else:
-        assert expected == cotverify.get_source_url(obj)
+        assert expected == await cotverify.get_source_url(obj)
+
+
+# _extract_hg_revision_from_source_url {{{1
+@pytest.mark.parametrize(
+    "url,expected",
+    (
+        ("https://hg.mozilla.org/mozilla-central/file/ccd787bf09e0f7c5bc36229622f26fe072445903/taskcluster/kinds/build", "ccd787bf09e0f7c5bc36229622f26fe072445903"),
+        ("https://hg.mozilla.org/mozilla-central/raw-file/deadbeef/.taskcluster.yml", "deadbeef"),
+        ("https://hg.mozilla.org/releases/mozilla-beta/file/abc123/taskcluster/kinds/signing", "abc123"),
+        ("https://hg.mozilla.org/mozilla-central/rev/abc123", "abc123"),
+        ("https://hg.mozilla.org/mozilla-central", None),
+    ),
+)
+def test_extract_hg_revision_from_source_url(url, expected):
+    assert cotverify._extract_hg_revision_from_source_url(url) == expected
+
+
+# _github_head_matches_hg_source {{{1
+# The revision pair below is real: it maps in lando's git2hg/firefox service.
+GITHUB_HEAD_REPO = "https://github.com/mozilla-firefox/firefox"
+GIT_REVISION = "f052455619779175711cf8c67b0b77b287dcbd46"
+HG_REVISION = "ccd787bf09e0f7c5bc36229622f26fe072445903"
+HG_SOURCE = "https://hg.mozilla.org/mozilla-central/file/{}/taskcluster/kinds/build-components".format(HG_REVISION)
+
+
+def _mismatch_obj(repo=GITHUB_HEAD_REPO, git_revision=GIT_REVISION, mapper_url="https://lando.moz.tools/api"):
+    obj = MagicMock()
+    obj.name = "signing:build"
+    obj.task = {"payload": {"env": {"GECKO_HEAD_REPOSITORY": repo, "GECKO_HEAD_REV": git_revision}}}
+    obj.context.config = {"source_env_prefix": "GECKO", "cot_product": "firefox", "git_hg_revision_mapper_url": mapper_url}
+    return obj
+
+
+@pytest.mark.parametrize(
+    "mapping,side_effect,restricted_privs,expected",
+    (
+        # mapping present and agrees -> accept regardless of privs
+        ({"git_hash": GIT_REVISION, "hg_hash": HG_REVISION}, None, True, True),
+        ({"git_hash": GIT_REVISION, "hg_hash": HG_REVISION}, None, False, True),
+        # mapping present but disagrees -> reject regardless of privs
+        ({"git_hash": GIT_REVISION, "hg_hash": "0" * 40}, None, True, False),
+        ({"git_hash": GIT_REVISION, "hg_hash": "0" * 40}, None, False, False),
+        # no mapping (404 / error) -> fail closed only when privileged
+        (None, ScriptWorkerException("404"), True, False),
+        (None, ScriptWorkerException("404"), False, True),
+    ),
+)
+@pytest.mark.asyncio
+async def test_github_head_matches_hg_source(mocker, mapping, side_effect, restricted_privs, expected):
+    async def fake_retry_request(context, url, **kwargs):
+        if side_effect:
+            raise side_effect
+        return mapping
+
+    mocker.patch.object(cotverify, "retry_request", new=fake_retry_request)
+    obj = _mismatch_obj()
+    assert await cotverify._github_head_matches_hg_source(obj, GITHUB_HEAD_REPO, HG_SOURCE, restricted_privs) is expected
+
+
+@pytest.mark.parametrize(
+    "repo,git_revision,mapper_url",
+    (
+        (GITHUB_HEAD_REPO, GIT_REVISION, ""),  # mapper disabled
+        ("https://hg.mozilla.org/mozilla-central", GIT_REVISION, "https://lando.moz.tools/api"),  # env repo not github
+        (GITHUB_HEAD_REPO, None, "https://lando.moz.tools/api"),  # no git revision
+    ),
+)
+@pytest.mark.asyncio
+async def test_github_head_matches_hg_source_short_circuits(mocker, repo, git_revision, mapper_url):
+    called = mocker.patch.object(cotverify, "retry_request")
+    obj = _mismatch_obj(repo=repo, git_revision=git_revision, mapper_url=mapper_url)
+    assert await cotverify._github_head_matches_hg_source(obj, repo, HG_SOURCE, True) is False
+    called.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    "mapping,side_effect,restricted_privs,raises",
+    (
+        # hg source + github env, mapping agrees -> get_source_url returns the hg source
+        ({"git_hash": GIT_REVISION, "hg_hash": HG_REVISION}, None, True, False),
+        # mapping disagrees -> CoTError
+        ({"git_hash": GIT_REVISION, "hg_hash": "0" * 40}, None, True, True),
+        # no mapping + restricted -> CoTError
+        (None, ScriptWorkerException("404"), True, True),
+        # no mapping + unrestricted -> accepted
+        (None, ScriptWorkerException("404"), False, False),
+    ),
+)
+@pytest.mark.asyncio
+async def test_get_source_url_hg_source_github_head(mocker, mapping, side_effect, restricted_privs, raises):
+    async def fake_retry_request(context, url, **kwargs):
+        if side_effect:
+            raise side_effect
+        return mapping
+
+    mocker.patch.object(cotverify, "retry_request", new=fake_retry_request)
+    obj = MagicMock()
+    obj.name = "signing:build"
+    obj.task = {"payload": {"env": {"GECKO_HEAD_REPOSITORY": GITHUB_HEAD_REPO, "GECKO_HEAD_REV": GIT_REVISION}}, "metadata": {"source": HG_SOURCE}}
+    obj.context.config = {"source_env_prefix": "GECKO", "cot_product": "firefox", "git_hg_revision_mapper_url": "https://lando.moz.tools/api"}
+    if raises:
+        with pytest.raises(CoTError):
+            await cotverify.get_source_url(obj, restricted_privs)
+    else:
+        assert await cotverify.get_source_url(obj, restricted_privs) == HG_SOURCE
 
 
 # trace_back_to_tree {{{1
