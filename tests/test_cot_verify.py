@@ -412,14 +412,28 @@ async def test_chain_is_try_or_pull_request(chain, bools, expected):
     assert await chain.is_try_or_pull_request() == expected
 
 
+FIREFOX_REPO = "https://github.com/mozilla-firefox/firefox"
+FIREFOX_KEY = "mozilla-firefox/firefox"
+ENTERPRISE_REPO = "https://github.com/mozilla/enterprise-firefox"
+ENTERPRISE_KEY = "mozilla/enterprise-firefox"
+THUNDERBIRD_REPO = "https://github.com/thunderbird/thunderbird-desktop"
+THUNDERBIRD_KEY = "thunderbird/thunderbird-desktop"
+HG_BETA_REPO = "https://hg.mozilla.org/releases/mozilla-beta"
+HG_REV = "127dce3ac830d68df8479b5f32c9d2430363dba2"
+
+
+def _firefox_env(ref):
+    return {"GECKO_HEAD_REPOSITORY": FIREFOX_REPO, "GECKO_HEAD_REF": ref}
+
+
 @pytest.mark.asyncio
-async def test_chain_is_try_or_pull_request_fallback_ref(mocker, chain):
-    """Links without a ref of their own fall back to their decision task's."""
+async def test_chain_is_try_or_pull_request_fallback_refs(mocker, chain):
+    """Links get the refs of their own decision task."""
     chain.decision_task_id = "decision_task_id"
     decision_link = cotverify.LinkOfTrust(chain.context, "decision", "decision_task_id")
-    decision_link.task = dict(chain.task, taskGroupId="decision_task_id", payload={"env": {"GECKO_HEAD_REF": "refs/heads/beta"}})
+    decision_link.task = dict(chain.task, taskGroupId="decision_task_id", payload={"env": _firefox_env("refs/heads/beta")})
     other_decision_link = cotverify.LinkOfTrust(chain.context, "decision", "other_decision_task_id")
-    other_decision_link.task = dict(chain.task, taskGroupId="other_decision_task_id", payload={"env": {"GECKO_HEAD_REF": "refs/heads/autoland"}})
+    other_decision_link.task = dict(chain.task, taskGroupId="other_decision_task_id", payload={"env": _firefox_env("refs/heads/autoland")})
     docker_image_link = cotverify.LinkOfTrust(chain.context, "docker-image", "docker_image_task_id")
     docker_image_link.task = dict(chain.task, taskGroupId="other_decision_task_id", payload={})
     orphan_link = cotverify.LinkOfTrust(chain.context, "build", "orphan_task_id")
@@ -429,19 +443,19 @@ async def test_chain_is_try_or_pull_request_fallback_ref(mocker, chain):
     names = {id(chain.task): "chain", **{id(link.task): link.task_id for link in chain.links}}
     calls = []
 
-    async def is_try_or_pull_request(context, task, fallback_ref=None):
-        calls.append((names[id(task)], fallback_ref))
+    async def is_try_or_pull_request(context, task, fallback_refs=None):
+        calls.append((names[id(task)], fallback_refs))
         return False
 
     mocker.patch.object(cotverify, "is_try_or_pull_request", is_try_or_pull_request)
     assert not await chain.is_try_or_pull_request()
     assert sorted(calls) == sorted(
         [
-            ("chain", "refs/heads/beta"),
-            ("decision_task_id", "refs/heads/beta"),
-            ("other_decision_task_id", "refs/heads/autoland"),
-            ("docker_image_task_id", "refs/heads/autoland"),
-            ("orphan_task_id", None),
+            ("chain", {FIREFOX_KEY: ["refs/heads/beta"]}),
+            ("decision_task_id", {FIREFOX_KEY: ["refs/heads/beta"]}),
+            ("other_decision_task_id", {FIREFOX_KEY: ["refs/heads/autoland"]}),
+            ("docker_image_task_id", {FIREFOX_KEY: ["refs/heads/autoland"]}),
+            ("orphan_task_id", {}),
         ]
     )
 
@@ -456,52 +470,82 @@ def _craft_link_with_payload(chain, task_id="decision_task_id", payload=None):
     "decision_payloads, expected",
     (
         # The decision task is in the chain
-        ([{"env": {"GECKO_HEAD_REF": "refs/heads/beta"}}], "refs/heads/beta"),
-        ([{"env": {"GECKO_HEAD_REF": "refs/tags/FIREFOX_BETA_123_0b1_RELEASE"}}], "refs/tags/FIREFOX_BETA_123_0b1_RELEASE"),
-        ([{"env": {"GECKO_HEAD_BRANCH": "beta"}}], "beta"),
+        ([{"env": _firefox_env("refs/heads/beta")}], {FIREFOX_KEY: ["refs/heads/beta"]}),
+        ([{"env": _firefox_env("refs/tags/FIREFOX_BETA_123_0b1_RELEASE")}], {FIREFOX_KEY: ["refs/tags/FIREFOX_BETA_123_0b1_RELEASE"]}),
+        ([{"env": {"GECKO_HEAD_REPOSITORY": FIREFOX_REPO, "GECKO_HEAD_BRANCH": "beta"}}], {FIREFOX_KEY: ["beta"]}),
         # *_HEAD_BRANCH takes precedence, like in get_branch()
-        ([{"env": {"GECKO_HEAD_BRANCH": "beta", "GECKO_HEAD_REF": "refs/heads/release"}}], "beta"),
-        # The decision task doesn't define a ref
-        ([{"env": {}}], None),
-        ([{}], None),
-        ([{"env": {"GECKO_HEAD_REV": "0129abcdef012345643456789abcdef012345678"}}], None),
-        # The decision task uses another prefix than this worker
-        ([{"env": {"MOBILE_HEAD_REF": "refs/heads/main"}}], None),
+        ([{"env": {**_firefox_env("refs/heads/release"), "GECKO_HEAD_BRANCH": "beta"}}], {FIREFOX_KEY: ["beta"]}),
+        # The decision task doesn't define a ref, or which repository it's for
+        ([{"env": {}}], {}),
+        ([{}], {}),
+        ([{"env": {"GECKO_HEAD_REPOSITORY": FIREFOX_REPO, "GECKO_HEAD_REV": "0129abcdef012345643456789abcdef012345678"}}], {}),
+        ([{"env": {"GECKO_HEAD_REF": "refs/heads/beta"}}], {}),
+        # Not a github repository: graphs generated from hg have an hg revision as their ref
+        ([{"env": {"GECKO_HEAD_REPOSITORY": HG_BETA_REPO, "GECKO_HEAD_REF": HG_REV}}], {}),
+        # Several repositories, e.g. Enterprise's Thunderbird build, each with their own ref
+        (
+            [
+                {
+                    "env": {
+                        "GECKO_HEAD_REPOSITORY": ENTERPRISE_REPO,
+                        "GECKO_HEAD_REF": "refs/heads/enterprise-release",
+                        "COMM_HEAD_REPOSITORY": THUNDERBIRD_REPO,
+                        "COMM_HEAD_REF": "refs/heads/release",
+                    }
+                }
+            ],
+            {ENTERPRISE_KEY: ["refs/heads/enterprise-release"], THUNDERBIRD_KEY: ["refs/heads/release"]},
+        ),
+        # Whatever the prefix, not just the worker's
+        ([{"env": {"MOBILE_HEAD_REPOSITORY": FIREFOX_REPO, "MOBILE_HEAD_REF": "refs/heads/main"}}], {FIREFOX_KEY: ["refs/heads/main"]}),
+        # Several refs for the same repository are all kept, in order
+        (
+            [{"env": {**_firefox_env("refs/heads/beta"), "VCS_HEAD_REPOSITORY": FIREFOX_REPO + ".git", "VCS_HEAD_REF": "refs/heads/release"}}],
+            {FIREFOX_KEY: ["refs/heads/beta", "refs/heads/release"]},
+        ),
+        # However the repository is spelled
+        ([{"env": {"GECKO_HEAD_REPOSITORY": FIREFOX_REPO + "/", "GECKO_HEAD_REF": "refs/heads/beta"}}], {FIREFOX_KEY: ["refs/heads/beta"]}),
+        ([{"env": {"GECKO_HEAD_REPOSITORY": FIREFOX_REPO + ".git", "GECKO_HEAD_REF": "refs/heads/beta"}}], {FIREFOX_KEY: ["refs/heads/beta"]}),
+        (
+            [{"env": {"GECKO_HEAD_REPOSITORY": "git@github.com:mozilla-firefox/firefox.git", "GECKO_HEAD_REF": "refs/heads/beta"}}],
+            {FIREFOX_KEY: ["refs/heads/beta"]},
+        ),
+        (
+            [{"env": {"GECKO_HEAD_REPOSITORY": "https://github.com/Mozilla-Firefox/Firefox", "GECKO_HEAD_REF": "refs/heads/beta"}}],
+            {FIREFOX_KEY: ["refs/heads/beta"]},
+        ),
         # The decision task isn't in the chain
-        ([], None),
+        ([], {}),
         # Several links have the decision task id
-        ([{"env": {"GECKO_HEAD_REF": "refs/heads/beta"}}, {"env": {"GECKO_HEAD_REF": "refs/heads/beta"}}], None),
+        ([{"env": _firefox_env("refs/heads/beta")}, {"env": _firefox_env("refs/heads/beta")}], {}),
     ),
 )
-def test_chain_get_decision_ref(chain, decision_payloads, expected):
+def test_chain_get_decision_refs(chain, decision_payloads, expected):
     chain.links = [_craft_link_with_payload(chain, payload=payload) for payload in decision_payloads]
-    assert chain._get_decision_ref("decision_task_id") == expected
+    assert chain._get_decision_refs("decision_task_id") == expected
 
 
-def test_chain_get_decision_ref_other_links(chain, build_link):
+def test_chain_get_decision_refs_other_links(chain, build_link):
     """Only the decision task matters, not other links of the chain."""
-    build_link.task["payload"]["env"] = {"GECKO_HEAD_REF": "refs/heads/release"}
+    build_link.task["payload"]["env"] = _firefox_env("refs/heads/release")
     chain.links = [
         build_link,
-        _craft_link_with_payload(chain, payload={"env": {"GECKO_HEAD_REF": "refs/heads/beta"}}),
-        _craft_link_with_payload(chain, task_id="other_decision_task_id", payload={"env": {"GECKO_HEAD_REF": "refs/heads/autoland"}}),
+        _craft_link_with_payload(chain, payload={"env": _firefox_env("refs/heads/beta")}),
+        _craft_link_with_payload(chain, task_id="other_decision_task_id", payload={"env": _firefox_env("refs/heads/autoland")}),
     ]
-    assert chain._get_decision_ref("decision_task_id") == "refs/heads/beta"
-    assert chain._get_decision_ref("other_decision_task_id") == "refs/heads/autoland"
-    assert chain._get_decision_ref(build_link.task_id) == "refs/heads/release"
-    assert chain._get_decision_ref("missing_task_id") is None
+    assert chain._get_decision_refs("decision_task_id") == {FIREFOX_KEY: ["refs/heads/beta"]}
+    assert chain._get_decision_refs("other_decision_task_id") == {FIREFOX_KEY: ["refs/heads/autoland"]}
+    assert chain._get_decision_refs(build_link.task_id) == {FIREFOX_KEY: ["refs/heads/release"]}
+    assert chain._get_decision_refs("missing_task_id") == {}
 
 
-@pytest.mark.parametrize("env, expected", (({"GECKO_HEAD_REF": "refs/heads/beta"}, "refs/heads/beta"), ({}, None)))
-def test_chain_get_decision_ref_self(chain, env, expected):
+@pytest.mark.parametrize("env, expected", ((_firefox_env("refs/heads/beta"), {FIREFOX_KEY: ["refs/heads/beta"]}), ({}, {})))
+def test_chain_get_decision_refs_self(chain, env, expected):
     """The chain's own task is its decision task, e.g. when verifying a decision task."""
     chain.task["payload"]["env"] = env
     # A link can't have the chain's task id; the chain's task is used even if one does
-    chain.links = [_craft_link_with_payload(chain, task_id=chain.task_id, payload={"env": {"GECKO_HEAD_REF": "refs/heads/release"}})]
-    assert chain._get_decision_ref(chain.task_id) == expected
-
-
-HG_REV = "127dce3ac830d68df8479b5f32c9d2430363dba2"
+    chain.links = [_craft_link_with_payload(chain, task_id=chain.task_id, payload={"env": _firefox_env("refs/heads/release")})]
+    assert chain._get_decision_refs(chain.task_id) == expected
 
 
 def _write_parameters(link, parameters):
@@ -511,52 +555,88 @@ def _write_parameters(link, parameters):
         yaml.safe_dump(parameters, fh)
 
 
+HG_BETA_ENV = {"GECKO_HEAD_REPOSITORY": HG_BETA_REPO, "GECKO_HEAD_REF": HG_REV}
+# Like the parameters of a graph generated from mozilla-beta
+HG_BETA_PARAMETERS = {
+    "base_ref": "",
+    "base_repository": "https://hg.mozilla.org/mozilla-unified",
+    "head_git_ref": "refs/heads/beta",
+    "head_git_repository": FIREFOX_REPO,
+    "head_ref": HG_REV,
+    "head_repository": HG_BETA_REPO,
+    "repository_type": "hg",
+}
+# Like the parameters of Enterprise's Thunderbird build graph
+THUNDERBIRD_PARAMETERS = {
+    "base_ref": "",
+    "base_repository": ENTERPRISE_REPO,
+    "comm_base_ref": "refs/heads/release",
+    "comm_base_repository": THUNDERBIRD_REPO,
+    "comm_head_ref": "refs/heads/release",
+    "comm_head_repository": THUNDERBIRD_REPO,
+    "head_git_repository": FIREFOX_REPO,
+    "head_ref": "refs/heads/enterprise-release",
+    "head_repository": ENTERPRISE_REPO,
+    "repository_type": "git",
+}
+
+
 @pytest.mark.parametrize(
-    "parameters, expected",
+    "env, parameters, expected",
     (
         # Graphs generated from hg: the git ref of the push is in the parameters
-        ({"head_ref": HG_REV, "head_git_ref": "refs/heads/beta"}, "refs/heads/beta"),
-        # Parameters without a git ref, or no parameters at all: the decision task's env is used
-        ({"head_ref": HG_REV}, HG_REV),
-        ({"head_ref": HG_REV, "head_git_ref": ""}, HG_REV),
-        (None, HG_REV),
+        (HG_BETA_ENV, HG_BETA_PARAMETERS, {FIREFOX_KEY: ["refs/heads/beta"]}),
+        # Without the repository it's for, or an actual ref, the git ref isn't used
+        (HG_BETA_ENV, {"head_ref": HG_REV, "head_git_ref": "refs/heads/beta"}, {}),
+        (HG_BETA_ENV, {**HG_BETA_PARAMETERS, "head_git_ref": ""}, {}),
+        (HG_BETA_ENV, {**HG_BETA_PARAMETERS, "head_git_ref": None}, {}),
+        (HG_BETA_ENV, {**HG_BETA_PARAMETERS, "head_git_ref": 123}, {}),
+        (HG_BETA_ENV, None, {}),
+        # Several repositories, e.g. Enterprise's Thunderbird build. head_git_repository has no ref here.
+        ({}, THUNDERBIRD_PARAMETERS, {ENTERPRISE_KEY: ["refs/heads/enterprise-release"], THUNDERBIRD_KEY: ["refs/heads/release"]}),
+        # Base refs aren't the push's
+        (
+            {},
+            {"base_repository": FIREFOX_REPO, "base_ref": "refs/heads/main", "comm_base_repository": THUNDERBIRD_REPO, "comm_base_ref": "refs/heads/main"},
+            {},
+        ),
+        # Refs from the env come first
+        (
+            _firefox_env("refs/heads/beta"),
+            {"head_git_repository": FIREFOX_REPO, "head_git_ref": "refs/heads/release"},
+            {FIREFOX_KEY: ["refs/heads/beta", "refs/heads/release"]},
+        ),
+        (_firefox_env("refs/heads/beta"), {"head_repository": FIREFOX_REPO, "head_ref": "refs/heads/beta"}, {FIREFOX_KEY: ["refs/heads/beta"]}),
     ),
 )
-def test_chain_get_decision_ref_head_git_ref(chain, parameters, expected):
-    decision_link = _craft_link_with_payload(chain, payload={"env": {"GECKO_HEAD_REF": HG_REV}})
+def test_chain_get_decision_refs_parameters(chain, env, parameters, expected):
+    decision_link = _craft_link_with_payload(chain, payload={"env": env})
     if parameters is not None:
         _write_parameters(decision_link, parameters)
     chain.links = [decision_link]
-    assert chain._get_decision_ref("decision_task_id") == expected
+    assert chain._get_decision_refs("decision_task_id") == expected
 
 
-@pytest.mark.parametrize("decision_in_chain, expected", ((True, "refs/heads/beta"), (False, HG_REV)))
-def test_chain_get_decision_ref_head_git_ref_action(chain, decision_in_chain, expected):
+@pytest.mark.parametrize("decision_in_chain, expected", ((True, {FIREFOX_KEY: ["refs/heads/beta"]}), (False, {})))
+def test_chain_get_decision_refs_parameters_action(chain, decision_in_chain, expected):
     """Parameters are only downloaded for decision tasks: an action task uses its decision task's."""
-    decision_link = _craft_link_with_payload(chain, payload={"env": {"GECKO_HEAD_REF": HG_REV}})
-    _write_parameters(decision_link, {"head_ref": HG_REV, "head_git_ref": "refs/heads/beta"})
+    decision_link = _craft_link_with_payload(chain, payload={"env": HG_BETA_ENV})
+    _write_parameters(decision_link, HG_BETA_PARAMETERS)
     action_link = cotverify.LinkOfTrust(chain.context, "action", "action_task_id")
-    action_link.task = dict(chain.task, taskGroupId="decision_task_id", payload={"env": {"GECKO_HEAD_REF": HG_REV}})
-    _write_parameters(action_link, {"head_ref": HG_REV, "head_git_ref": "refs/heads/release"})
+    action_link.task = dict(chain.task, taskGroupId="decision_task_id", payload={"env": HG_BETA_ENV})
+    _write_parameters(action_link, {**HG_BETA_PARAMETERS, "head_git_ref": "refs/heads/release"})
     chain.links = [decision_link, action_link] if decision_in_chain else [action_link]
-    assert chain._get_decision_ref("action_task_id") == expected
+    assert chain._get_decision_refs("action_task_id") == expected
 
 
-def test_chain_get_decision_ref_head_git_ref_not_parent(chain, build_link):
+def test_chain_get_decision_refs_parameters_not_parent(chain, build_link):
     """Only parent tasks' parameters are used."""
-    decision_link = _craft_link_with_payload(chain, payload={"env": {"GECKO_HEAD_REF": HG_REV}})
-    _write_parameters(decision_link, {"head_git_ref": "refs/heads/beta"})
-    build_link.task["payload"]["env"] = {"GECKO_HEAD_REF": "refs/heads/release"}
+    decision_link = _craft_link_with_payload(chain, payload={"env": HG_BETA_ENV})
+    _write_parameters(decision_link, HG_BETA_PARAMETERS)
+    build_link.task["payload"]["env"] = _firefox_env("refs/heads/release")
+    _write_parameters(build_link, HG_BETA_PARAMETERS)
     chain.links = [decision_link, build_link]
-    assert chain._get_decision_ref(build_link.task_id) == "refs/heads/release"
-
-
-def test_chain_get_decision_ref_mobile(mobile_chain):
-    """The env prefix comes from the worker's config."""
-    mobile_chain.links = [
-        _craft_link_with_payload(mobile_chain, payload={"env": {"MOBILE_HEAD_REF": "refs/heads/main", "GECKO_HEAD_REF": "refs/heads/beta"}}),
-    ]
-    assert mobile_chain._get_decision_ref("decision_task_id") == "refs/heads/main"
+    assert chain._get_decision_refs(build_link.task_id) == {FIREFOX_KEY: ["refs/heads/release"]}
 
 
 # get_link {{{1
@@ -2605,7 +2685,7 @@ async def test_trace_back_to_tree_git_graph_not_mapped(chain, decision_link, bui
         await cotverify.trace_back_to_tree(chain)
 
 
-@pytest.mark.parametrize("parameters, raises", (({"head_git_ref": "refs/heads/beta"}, False), ({}, True)))
+@pytest.mark.parametrize("parameters, raises", ((HG_BETA_PARAMETERS, False), ({"head_ref": HG_REV, "head_repository": HG_BETA_REPO}, True)))
 @pytest.mark.asyncio
 async def test_trace_back_to_tree_git_mirror_head_git_ref(chain, decision_link, build_link, docker_image_link, mocker, parameters, raises):
     # A task sourced from the mirror without a ref of its own, in a graph generated
@@ -2614,8 +2694,9 @@ async def test_trace_back_to_tree_git_mirror_head_git_ref(chain, decision_link, 
     del chain.task["payload"]["env"]["GECKO_HEAD_REPOSITORY"]
     _use_git_mirror(build_link)
     build_link.task["payload"]["env"]["GECKO_HEAD_REF"] = "refs/heads/beta"
-    decision_link.task["payload"]["env"] = {"GECKO_HEAD_REF": HG_REV}
-    _write_parameters(decision_link, {"head_ref": HG_REV, **parameters})
+    hg_repo = decision_link.task["metadata"]["source"]
+    decision_link.task["payload"]["env"] = {"GECKO_HEAD_REPOSITORY": hg_repo, "GECKO_HEAD_REF": HG_REV}
+    _write_parameters(decision_link, {**parameters, "head_repository": hg_repo})
     chain.links = [decision_link, build_link, docker_image_link]
 
     calls = []
@@ -2630,10 +2711,75 @@ async def test_trace_back_to_tree_git_mirror_head_git_ref(chain, decision_link, 
     if raises:
         with pytest.raises(CoTError, match="has restricted privilege scope, and is_try_or_pull_request"):
             await cotverify.trace_back_to_tree(chain)
-        assert HG_REV in calls
+        # The hg revision isn't a ref of the mirror, so it's not even tried
+        assert HG_REV not in calls
+        assert None in calls
     else:
         await cotverify.trace_back_to_tree(chain)
         assert calls == ["refs/heads/beta", "refs/heads/beta"]
+
+
+@pytest.mark.asyncio
+async def test_chain_is_try_or_pull_request_enterprise_thunderbird(mocker, chain):
+    """Each commit is checked against a ref of its own repository (bug 2089986).
+
+    Enterprise's Thunderbird build is sourced from thunderbird-desktop (COMM_*), but the
+    enterprise workers' env prefix, GECKO, points to enterprise-firefox.
+    """
+    gecko_rev, comm_rev = "8b83b8fff4480334098ecbf9a2cd593576794a45", "abff12af096fa4d6af9579d8daea86e7f8036da9"
+    chain.context.config["official_github_repos_owner"] = ("mozilla", "thunderbird")
+    chain.decision_task_id = "decision_task_id"
+    chain.task["metadata"]["source"] = f"{THUNDERBIRD_REPO}/blob/{comm_rev}/taskcluster/kinds/build-signing"
+    decision_link = _craft_link_with_payload(
+        chain,
+        payload={
+            "env": {
+                "COMM_HEAD_REF": "refs/heads/release",
+                "COMM_HEAD_REPOSITORY": THUNDERBIRD_REPO,
+                "COMM_HEAD_REV": comm_rev,
+                "GECKO_HEAD_REF": "refs/heads/enterprise-release",
+                "GECKO_HEAD_REPOSITORY": ENTERPRISE_REPO,
+                "GECKO_HEAD_REV": gecko_rev,
+            }
+        },
+    )
+    decision_link.task["metadata"] = {"source": f"{THUNDERBIRD_REPO}/raw/{comm_rev}/.taskcluster.yml", "owner": "foo@example.tld"}
+    _write_parameters(decision_link, THUNDERBIRD_PARAMETERS)
+    # Like build tasks, which don't define the ref of the comm repository
+    build_link = cotverify.LinkOfTrust(chain.context, "build", "build_task_id")
+    build_link.task = dict(
+        chain.task,
+        taskGroupId="decision_task_id",
+        payload={
+            "env": {
+                "COMM_HEAD_REPOSITORY": THUNDERBIRD_REPO,
+                "COMM_HEAD_REV": comm_rev,
+                "GECKO_HEAD_REF": "refs/heads/enterprise-release",
+                "GECKO_HEAD_REPOSITORY": ENTERPRISE_REPO,
+                "GECKO_HEAD_REV": gecko_rev,
+            }
+        },
+        metadata={"source": f"{THUNDERBIRD_REPO}/blob/{comm_rev}/taskcluster/kinds/build", "owner": "foo@example.tld"},
+    )
+    chain.links = [decision_link, build_link]
+
+    # What's actually on github
+    landed = {(ENTERPRISE_KEY, gecko_rev, "refs/heads/enterprise-release"), (THUNDERBIRD_KEY, comm_rev, "refs/heads/release")}
+    calls = []
+
+    def github_repository(context, owner, repo_name):
+        async def has_commit_landed_on_repository(context, revision, ref):
+            calls.append((f"{owner}/{repo_name}", revision, ref))
+            return (f"{owner}/{repo_name}", revision, ref) in landed
+
+        repository = MagicMock()
+        repository.has_commit_landed_on_repository = has_commit_landed_on_repository
+        return repository
+
+    mocker.patch.object(swtask, "GitHubRepository", side_effect=github_repository)
+    assert not await chain.is_try_or_pull_request()
+    # Never the ref of one repository for a commit of the other
+    assert set(calls) == landed
 
 
 # AuditLogFormatter {{{1

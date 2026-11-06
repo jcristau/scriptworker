@@ -48,6 +48,7 @@ from scriptworker.github import (
 )
 from scriptworker.log import contextual_log_handler, get_chain_of_trust_log_filename
 from scriptworker.task import (
+    add_ref_for_repo,
     get_action_callback_name,
     get_and_check_tasks_for,
     get_base_branch,
@@ -55,6 +56,7 @@ from scriptworker.task import (
     get_branch,
     get_commit_message,
     get_decision_task_id,
+    get_head_refs_by_repo,
     get_head_revision,
     get_parent_task_id,
     get_project,
@@ -69,6 +71,7 @@ from scriptworker.task import (
     is_action,
     is_github_task,
     is_try_or_pull_request,
+    merge_refs_by_repo,
     retry_get_task_definition,
 )
 from scriptworker.utils import (
@@ -97,6 +100,28 @@ log = logging.getLogger(__name__)
 
 DECISION_TASK_TYPES = ("decision",)
 PARENT_TASK_TYPES = ("decision", "action")
+
+
+def _get_head_refs_by_repo_from_parameters(parameters):
+    """Get the head refs of each GitHub repository in a decision task's parameters.
+
+    Args:
+        parameters (dict): the parameters.
+
+    Returns:
+        dict: maps repository keys (see ``get_github_repo_key``) to lists of refs.
+
+    """
+    refs_by_repo = {}
+    if not isinstance(parameters, dict):
+        return refs_by_repo
+    suffix = "_repository"
+    for key, repo_url in parameters.items():
+        if key.endswith(suffix) and "head" in key[: -len(suffix)].split("_"):
+            ref = parameters.get(key[: -len(suffix)] + "_ref")
+            if isinstance(ref, str):
+                add_ref_for_repo(refs_by_repo, repo_url, ref)
+    return refs_by_repo
 
 
 # ChainOfTrust {{{1
@@ -151,36 +176,41 @@ class ChainOfTrust(object):
             bool: True if a task is a try task.
 
         """
-        tasks = [asyncio.ensure_future(link.is_try_or_pull_request(fallback_ref=self._get_decision_ref(link.decision_task_id))) for link in self.links]
-        tasks.insert(0, asyncio.ensure_future(is_try_or_pull_request(self.context, self.task, fallback_ref=self._get_decision_ref(self.decision_task_id))))
+        tasks = [asyncio.ensure_future(link.is_try_or_pull_request(fallback_refs=self._get_decision_refs(link.decision_task_id))) for link in self.links]
+        tasks.insert(0, asyncio.ensure_future(is_try_or_pull_request(self.context, self.task, fallback_refs=self._get_decision_refs(self.decision_task_id))))
 
         conditions = await raise_future_exceptions(tasks)
         return any(conditions)
 
-    def _get_decision_ref(self, decision_task_id):
-        """Get the ref (branch or tag) of a decision task in the chain.
+    def _get_decision_refs(self, decision_task_id):
+        """Get the refs of each GitHub repository a decision task of the chain uses.
 
         Some tasks, like docker-image or scriptworker ones, don't define their
-        own ref. Their decision task does, and it's the push the task comes from.
+        own refs. Their decision task does, and it's the push the task comes from.
 
-        XXX Graphs generated from hg have an hg revision as their ref, but some of
-        their tasks are sourced from the git mirror. The ``head_git_ref`` parameter
-        tells which ref of the mirror the push is on, so it takes precedence. Remove
-        this once the hg -> git migration is complete.
+        Refs come from the decision task's env (see ``get_head_refs_by_repo``), then
+        from its parameters: each ``<name>_repository`` parameter with ``head`` in
+        its name is paired with ``<name>_ref``, e.g. ``head_repository`` and
+        ``head_ref``, or ``comm_head_repository`` and ``comm_head_ref``.
+
+        XXX Graphs generated from hg have hg repositories in their env, but some of
+        their tasks are sourced from the git mirror. The ``head_git_repository`` and
+        ``head_git_ref`` parameters tell which ref of the mirror the push is on.
 
         Args:
             decision_task_id (str): the task id of the decision task.
 
         Returns:
-            str: the ref, or None if the decision task isn't in the chain or doesn't define one.
+            dict: maps repository keys (see ``get_github_repo_key``) to lists of refs.
+                Empty if the decision task isn't in the chain or doesn't define any.
 
         """
         if decision_task_id == self.task_id:
-            return get_branch(self.task, self.context.config["source_env_prefix"])
+            return get_head_refs_by_repo(self.task)
         try:
             link = self.get_link(decision_task_id)
         except CoTError:
-            return None
+            return {}
 
         # Parameters are only downloaded for decision tasks. An action task's push is its decision task's.
         parameters_link = link
@@ -189,13 +219,13 @@ class ChainOfTrust(object):
                 parameters_link = self.get_link(link.decision_task_id)
             except CoTError:
                 parameters_link = None
+        refs_from_parameters = {}
         if parameters_link is not None and parameters_link.task_type in DECISION_TASK_TYPES:
             path = parameters_link.get_artifact_full_path("public/parameters.yml")
             if os.path.exists(path):
-                if head_git_ref := load_json_or_yaml(path, is_path=True, file_type="yaml").get("head_git_ref"):
-                    return head_git_ref
+                refs_from_parameters = _get_head_refs_by_repo_from_parameters(load_json_or_yaml(path, is_path=True, file_type="yaml"))
 
-        return get_branch(link.task, self.context.config["source_env_prefix"])
+        return merge_refs_by_repo(get_head_refs_by_repo(link.task), refs_from_parameters)
 
     def get_link(self, task_id):
         """Get a ``LinkOfTrust`` by task id.
@@ -333,18 +363,18 @@ class LinkOfTrust(object):
         self.parent_task_id = get_parent_task_id(self.task)
         self.worker_impl = guess_worker_impl(self)
 
-    async def is_try_or_pull_request(self, fallback_ref=None):
+    async def is_try_or_pull_request(self, fallback_refs=None):
         """Determine if the task is either a try or a pull request one.
 
         Args:
-            fallback_ref (str, optional): the ref to check commits against if the
-                task doesn't define one. See ``scriptworker.task.is_pull_request``.
+            fallback_refs (dict, optional): more refs to check commits against.
+                See ``scriptworker.task.is_pull_request``.
 
         Returns:
             bool: True if the task is either a try or a pull request one.
 
         """
-        return await is_try_or_pull_request(self.context, self.task, fallback_ref=fallback_ref)
+        return await is_try_or_pull_request(self.context, self.task, fallback_refs=fallback_refs)
 
     @property
     def cot(self):

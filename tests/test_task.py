@@ -430,24 +430,147 @@ async def test_is_pull_request(mocker, mobile_context, task, has_commit_landed, 
 
 
 @pytest.mark.parametrize(
-    "env, fallback_ref, expected_ref",
+    "url, expected",
     (
-        ({"MOBILE_HEAD_REF": "refs/heads/main"}, None, "refs/heads/main"),
-        ({"MOBILE_HEAD_REF": "refs/heads/main"}, "refs/heads/other", "refs/heads/main"),
-        ({"MOBILE_HEAD_BRANCH": "main", "MOBILE_HEAD_REF": "refs/heads/other"}, None, "main"),
-        ({"MOBILE_HEAD_REF": "refs/tags/v1.0.0"}, None, "refs/tags/v1.0.0"),
-        # e.g. docker-image or scriptworker tasks: use the ref of their decision task
-        ({}, "refs/heads/main", "refs/heads/main"),
-        ({}, None, None),
+        ("https://github.com/mozilla-mobile/some-repo", "mozilla-mobile/some-repo"),
+        ("https://github.com/mozilla-mobile/some-repo/", "mozilla-mobile/some-repo"),
+        ("https://github.com/mozilla-mobile/some-repo.git", "mozilla-mobile/some-repo"),
+        ("https://github.com/Mozilla-Mobile/Some-Repo", "mozilla-mobile/some-repo"),
+        ("ssh://github.com/mozilla-mobile/some-repo", "mozilla-mobile/some-repo"),
+        ("git@github.com:mozilla-mobile/some-repo.git", "mozilla-mobile/some-repo"),
+        ("https://github.com/mozilla-mobile/some-repo/raw/0123456789abcdef0123456789abcdef01234567/.taskcluster.yml", "mozilla-mobile/some-repo"),
+        ("https://github.com/mozilla-mobile", None),
+        ("https://hg.mozilla.org/mozilla-central", None),
+        ("https://gitlab.com/mozilla-mobile/some-repo", None),
+        ("", None),
+        (None, None),
+        (123, None),
+    ),
+)
+def test_get_github_repo_key(url, expected):
+    assert swtask.get_github_repo_key(url) == expected
+
+
+@pytest.mark.parametrize(
+    "env, expected",
+    (
+        (
+            {"MOBILE_HEAD_REPOSITORY": "https://github.com/mozilla-mobile/some-repo", "MOBILE_HEAD_REF": "refs/heads/main"},
+            {"mozilla-mobile/some-repo": ["refs/heads/main"]},
+        ),
+        ({"MOBILE_HEAD_REPOSITORY": "https://github.com/mozilla-mobile/some-repo", "MOBILE_HEAD_BRANCH": "main"}, {"mozilla-mobile/some-repo": ["main"]}),
+        # *_HEAD_BRANCH takes precedence, like in get_branch()
+        (
+            {"MOBILE_HEAD_REPOSITORY": "https://github.com/mozilla-mobile/some-repo", "MOBILE_HEAD_BRANCH": "main", "MOBILE_HEAD_REF": "refs/heads/other"},
+            {"mozilla-mobile/some-repo": ["main"]},
+        ),
+        # Several repositories, each with their own ref
+        (
+            {
+                "GECKO_HEAD_REPOSITORY": "https://github.com/mozilla/enterprise-firefox",
+                "GECKO_HEAD_REF": "refs/heads/enterprise-release",
+                "COMM_HEAD_REPOSITORY": "https://github.com/thunderbird/thunderbird-desktop",
+                "COMM_HEAD_REF": "refs/heads/release",
+            },
+            {"mozilla/enterprise-firefox": ["refs/heads/enterprise-release"], "thunderbird/thunderbird-desktop": ["refs/heads/release"]},
+        ),
+        # Several refs for the same repository
+        (
+            {
+                "GECKO_HEAD_REPOSITORY": "https://github.com/mozilla-firefox/firefox",
+                "GECKO_HEAD_REF": "refs/heads/beta",
+                "VCS_HEAD_REPOSITORY": "https://github.com/mozilla-firefox/firefox.git",
+                "VCS_HEAD_REF": "refs/heads/release",
+                "OTHER_HEAD_REPOSITORY": "https://github.com/Mozilla-Firefox/Firefox",
+                "OTHER_HEAD_REF": "refs/heads/beta",
+            },
+            {"mozilla-firefox/firefox": ["refs/heads/beta", "refs/heads/release"]},
+        ),
+        # A repository without a ref, a ref without a repository, base refs, or not a github repository
+        ({"COMM_HEAD_REPOSITORY": "https://github.com/thunderbird/thunderbird-desktop", "COMM_HEAD_REV": "abcdef"}, {}),
+        ({"MOBILE_HEAD_REF": "refs/heads/main"}, {}),
+        ({"MOBILE_BASE_REPOSITORY": "https://github.com/mozilla-mobile/some-repo", "MOBILE_BASE_REF": "refs/heads/main"}, {}),
+        ({"GECKO_HEAD_REPOSITORY": "https://hg.mozilla.org/mozilla-central", "GECKO_HEAD_REF": "0123456789abcdef0123456789abcdef01234567"}, {}),
+        ({"_HEAD_REPOSITORY": "https://github.com/mozilla-mobile/some-repo", "_HEAD_REF": "refs/heads/main"}, {}),
+        ({"HEAD_REPOSITORY": "https://github.com/mozilla-mobile/some-repo", "HEAD_REF": "refs/heads/main"}, {}),
+        ({}, {}),
+    ),
+)
+def test_get_head_refs_by_repo(env, expected):
+    assert swtask.get_head_refs_by_repo({"payload": {"env": env}}) == expected
+
+
+@pytest.mark.parametrize("task", ({"payload": {}}, {"payload": {"env": None}}, {}))
+def test_get_head_refs_by_repo_no_env(task):
+    assert swtask.get_head_refs_by_repo(task) == {}
+
+
+def test_merge_refs_by_repo():
+    assert swtask.merge_refs_by_repo() == {}
+    assert swtask.merge_refs_by_repo(
+        {"a/a": ["refs/heads/main", "refs/heads/beta"], "b/b": ["refs/heads/main"]},
+        {"a/a": ["refs/heads/beta", "refs/heads/release"], "c/c": ["refs/heads/main"]},
+        {},
+    ) == {"a/a": ["refs/heads/main", "refs/heads/beta", "refs/heads/release"], "b/b": ["refs/heads/main"], "c/c": ["refs/heads/main"]}
+
+
+REPO = "https://github.com/mozilla-mobile/some-repo"
+REPO_KEY = "mozilla-mobile/some-repo"
+REV = "0123456789abcdef0123456789abcdef01234567"
+
+
+@pytest.mark.parametrize(
+    "env, fallback_refs, landed_refs, expected_calls, expected",
+    (
+        # The task's own ref
+        ({"MOBILE_HEAD_REPOSITORY": REPO, "MOBILE_HEAD_REF": "refs/heads/main"}, None, {"refs/heads/main"}, ["refs/heads/main"], False),
+        ({"MOBILE_HEAD_REPOSITORY": REPO, "MOBILE_HEAD_REF": "refs/tags/v1.0.0"}, None, {"refs/tags/v1.0.0"}, ["refs/tags/v1.0.0"], False),
+        # The task's own refs come first, then the fallback ones until the commit is found
+        (
+            {"MOBILE_HEAD_REPOSITORY": REPO, "MOBILE_HEAD_REF": "refs/heads/main"},
+            {REPO_KEY: ["refs/heads/other"]},
+            {"refs/heads/main"},
+            ["refs/heads/main"],
+            False,
+        ),
+        (
+            {"MOBILE_HEAD_REPOSITORY": REPO, "MOBILE_HEAD_REF": "refs/heads/main"},
+            {REPO_KEY: ["refs/heads/other"]},
+            {"refs/heads/other"},
+            ["refs/heads/main", "refs/heads/other"],
+            False,
+        ),
+        (
+            {"MOBILE_HEAD_REPOSITORY": REPO, "MOBILE_HEAD_REF": "refs/heads/main"},
+            {REPO_KEY: ["refs/heads/main", "refs/heads/other"]},
+            set(),
+            ["refs/heads/main", "refs/heads/other"],
+            True,
+        ),
+        # e.g. docker-image or scriptworker tasks: use the refs of their decision task
+        ({}, {REPO_KEY: ["refs/heads/main"]}, {"refs/heads/main"}, ["refs/heads/main"], False),
+        # Refs of other repositories don't count
+        ({}, {"mozilla-mobile/other-repo": ["refs/heads/main"]}, {"refs/heads/main"}, [None], True),
+        (
+            {"MOBILE_HEAD_REPOSITORY": "https://github.com/mozilla-mobile/other-repo", "MOBILE_HEAD_REF": "refs/heads/main"},
+            None,
+            {"refs/heads/main"},
+            [None],
+            True,
+        ),
+        # No ref at all
+        ({}, None, set(), [None], True),
+        ({}, {}, set(), [None], True),
     ),
 )
 @pytest.mark.asyncio
-async def test_is_pull_request_ref(mocker, mobile_context, env, fallback_ref, expected_ref):
+async def test_is_pull_request_refs(mocker, mobile_context, env, fallback_refs, landed_refs, expected_calls, expected):
     calls = []
 
     async def has_commit_landed_on_repository(context, revision, ref):
-        calls.append((revision, ref))
-        return True
+        assert revision == REV
+        calls.append(ref)
+        return ref in landed_refs
 
     github_repository_instance_mock = MagicMock()
     github_repository_instance_mock.has_commit_landed_on_repository = has_commit_landed_on_repository
@@ -456,10 +579,45 @@ async def test_is_pull_request_ref(mocker, mobile_context, env, fallback_ref, ex
     task = {
         "payload": {"env": env},
         "extra": {"tasks_for": "github-push"},
-        "metadata": {"source": "https://github.com/mozilla-mobile/some-repo/raw/0123456789abcdef0123456789abcdef01234567/.taskcluster.yml"},
+        "metadata": {"source": f"{REPO}/raw/{REV}/.taskcluster.yml"},
     }
-    assert not await swtask.is_pull_request(mobile_context, task, fallback_ref=fallback_ref)
-    assert calls == [("0123456789abcdef0123456789abcdef01234567", expected_ref)]
+    assert await swtask.is_pull_request(mobile_context, task, fallback_refs=fallback_refs) == expected
+    assert calls == expected_calls
+
+
+@pytest.mark.asyncio
+async def test_is_pull_request_several_repositories(mocker, mobile_context):
+    """Each commit is checked against the refs of its own repository."""
+    other_rev = "f" * 40
+    calls = []
+
+    def github_repository(context, owner, repo_name):
+        async def has_commit_landed_on_repository(context, revision, ref):
+            calls.append((f"{owner}/{repo_name}", revision, ref))
+            return True
+
+        repository = MagicMock()
+        repository.has_commit_landed_on_repository = has_commit_landed_on_repository
+        return repository
+
+    mocker.patch.object(swtask, "GitHubRepository", side_effect=github_repository)
+    task = {
+        "payload": {
+            "env": {
+                "MOBILE_HEAD_REPOSITORY": "https://github.com/mozilla-mobile/other-repo",
+                "MOBILE_HEAD_REV": other_rev,
+                "MOBILE_HEAD_REF": "refs/heads/other-branch",
+                "COMM_HEAD_REPOSITORY": REPO,
+            }
+        },
+        "extra": {"tasks_for": "github-push"},
+        "metadata": {"source": f"{REPO}/raw/{REV}/.taskcluster.yml"},
+    }
+    assert not await swtask.is_pull_request(mobile_context, task, fallback_refs={REPO_KEY: ["refs/heads/main"]})
+    assert calls == [
+        ("mozilla-mobile/other-repo", other_rev, "refs/heads/other-branch"),
+        (REPO_KEY, REV, "refs/heads/main"),
+    ]
 
 
 @pytest.mark.parametrize(

@@ -505,7 +505,95 @@ def is_try(task, source_env_prefix):
     )
 
 
-async def is_pull_request(context, task, fallback_ref=None):
+def get_github_repo_key(url):
+    """Get a key identifying a GitHub repository, regardless of how its URL is spelled.
+
+    Args:
+        url (str): the URL of the repository, e.g. ``https://github.com/Owner/Repo.git``
+
+    Returns:
+        str: ``owner/repo``, lowercased like GitHub treats them. None if ``url`` isn't a GitHub repository.
+
+    """
+    if not url or not isinstance(url, str):
+        return None
+    url = url.replace("git@github.com:", "ssh://github.com/", 1)
+    if not is_github_url(url):
+        return None
+    try:
+        owner, name = extract_github_repo_owner_and_name(url)
+    except ValueError:
+        return None
+    return f"{owner}/{name}".lower()
+
+
+def add_ref_for_repo(refs_by_repo, repo_url, ref):
+    """Record that ``ref`` is a ref of the GitHub repository at ``repo_url``.
+
+    Refs are kept in the order they're added, without duplicates. Nothing is
+    recorded if ``repo_url`` isn't a GitHub repository or ``ref`` is empty.
+
+    Args:
+        refs_by_repo (dict): maps repository keys (see ``get_github_repo_key``) to lists of refs. Modified in place.
+        repo_url (str): the URL of the repository.
+        ref (str): the ref.
+
+    """
+    repo_key = get_github_repo_key(repo_url)
+    if repo_key is None or not ref:
+        return
+    refs = refs_by_repo.setdefault(repo_key, [])
+    if ref not in refs:
+        refs.append(ref)
+
+
+def merge_refs_by_repo(*refs_by_repos):
+    """Merge mappings of repositories to refs, keeping refs in order and without duplicates.
+
+    Args:
+        *refs_by_repos (dict): maps repository keys (see ``get_github_repo_key``) to lists of refs.
+
+    Returns:
+        dict: the merged mapping.
+
+    """
+    merged = {}
+    for refs_by_repo in refs_by_repos:
+        for repo_key, refs in refs_by_repo.items():
+            merged_refs = merged.setdefault(repo_key, [])
+            for ref in refs:
+                if ref not in merged_refs:
+                    merged_refs.append(ref)
+    return merged
+
+
+def get_head_refs_by_repo(task):
+    """Get the head refs of each GitHub repository a task defines in its env.
+
+    Tasks may check out several repositories, e.g. ``GECKO_HEAD_REPOSITORY`` and
+    ``COMM_HEAD_REPOSITORY`` for Enterprise's Thunderbird build. Each ``<PREFIX>_HEAD_REPOSITORY`` is
+    paired with ``<PREFIX>_HEAD_BRANCH``, or ``<PREFIX>_HEAD_REF``, like ``get_branch``.
+
+    Args:
+        task (dict): the task definition.
+
+    Returns:
+        dict: maps repository keys (see ``get_github_repo_key``) to lists of refs.
+
+    """
+    env = task.get("payload", {}).get("env", {})
+    refs_by_repo = {}
+    if not isinstance(env, dict):
+        return refs_by_repo
+    suffix = "_HEAD_REPOSITORY"
+    for key, repo_url in env.items():
+        if key.endswith(suffix) and key != suffix:
+            prefix = key[: -len(suffix)]
+            add_ref_for_repo(refs_by_repo, repo_url, env.get(f"{prefix}_HEAD_BRANCH") or env.get(f"{prefix}_HEAD_REF"))
+    return refs_by_repo
+
+
+async def is_pull_request(context, task, fallback_refs=None):
     """Determine if a task is a pull-request-like task (restricted privs).
 
     This goes further than checking ``tasks_for``. We may or may not want
@@ -516,15 +604,16 @@ async def is_pull_request(context, task, fallback_ref=None):
         * ``task.extra.env.tasks_for`` is "github-pull-request" or "github-pull-request-untrusted"
         * ``task.payload.env.MOBILE_HEAD_REPOSITORY`` doesn't come from an official repo
         * ``task.metadata.source`` doesn't come from an official repo, either
-        * The last 2 items are landed on the official repo, i.e. reachable from the
-          task's ref (``*_HEAD_REF``/``*_HEAD_BRANCH``), or from ``fallback_ref``
-          when the task doesn't define one
+        * The last 2 items are landed on the official repo, i.e. reachable from one of
+          the refs of that repo: the task's own (see ``get_head_refs_by_repo``), then
+          the ones in ``fallback_refs``
 
     Args:
         context (scriptworker.context.Context): the scriptworker context.
         task (dict): the task definition to check.
-        fallback_ref (str, optional): the ref to check commits against when the task
-            doesn't define one, typically the one of the task's decision task.
+        fallback_refs (dict, optional): more refs to check commits against, typically
+            the ones of the task's decision task. Maps repository keys (see
+            ``get_github_repo_key``) to lists of refs.
 
     Returns:
         bool: True if it's a pull-request. False if it either comes from the official repos or if
@@ -535,7 +624,7 @@ async def is_pull_request(context, task, fallback_ref=None):
     tasks_for = task.get("extra", {}).get("tasks_for")
     repo_url_from_payload = get_repo(task, context.config["source_env_prefix"])
     revision_from_payload = get_revision(task, context.config["source_env_prefix"])
-    ref = get_branch(task, context.config["source_env_prefix"]) or fallback_ref
+    refs_by_repo = merge_refs_by_repo(get_head_refs_by_repo(task), fallback_refs or {})
 
     metadata_source_url = task["metadata"].get("source", "")
     repo_from_source_url, revision_from_source_url = extract_github_repo_and_revision_from_source_url(metadata_source_url)
@@ -556,12 +645,22 @@ async def is_pull_request(context, task, fallback_ref=None):
             continue
 
         github_repository = GitHubRepository(context, repo_owner, repo_name)
-        conditions.append(not await github_repository.has_commit_landed_on_repository(context, revision, ref))
+        # Only refs of this repository: a graph may use several, e.g. Enterprise's Thunderbird build
+        refs = refs_by_repo.get(f"{repo_owner}/{repo_name}".lower(), [])
+        conditions.append(not await _has_commit_landed_on_any_ref(context, github_repository, revision, refs))
 
     return any(conditions)
 
 
-async def is_try_or_pull_request(context, task, fallback_ref=None):
+async def _has_commit_landed_on_any_ref(context, github_repository, revision, refs):
+    # Without any ref, has_commit_landed_on_repository() still handles tags, and logs why it can't tell otherwise.
+    for ref in refs or [None]:
+        if await github_repository.has_commit_landed_on_repository(context, revision, ref):
+            return True
+    return False
+
+
+async def is_try_or_pull_request(context, task, fallback_refs=None):
     """Determine if a task is a try or a pull-request-like task (restricted privs).
 
     Checks are the ones done in ``is_try`` and ``is_pull_request``
@@ -569,14 +668,14 @@ async def is_try_or_pull_request(context, task, fallback_ref=None):
     Args:
         context (scriptworker.context.Context): the scriptworker context.
         task (dict): the task definition to check.
-        fallback_ref (str, optional): passed to ``is_pull_request``.
+        fallback_refs (dict, optional): passed to ``is_pull_request``.
 
     Returns:
         bool: True if it's a pull-request or a try task
 
     """
     if is_github_task(task):
-        return await is_pull_request(context, task, fallback_ref=fallback_ref)
+        return await is_pull_request(context, task, fallback_refs=fallback_refs)
     else:
         return is_try(task, context.config["source_env_prefix"])
 
